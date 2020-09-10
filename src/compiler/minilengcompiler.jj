@@ -1,0 +1,2123 @@
+/**
+ * Compilador minileng (Procesadores de Lenguajes)
+ * Guillermo Cruz Rojas
+ * v1.1 - 2019/09/08
+ */
+
+options
+{
+  static = true;
+  ignore_case = true;
+}
+
+PARSER_BEGIN(minilengcompiler)
+package compiler;
+
+import java.io.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Iterator;
+import tools.Tabla_verbose;
+import tools.Tabla_simbolos;
+import tools.RegistroExpr;
+import tools.Simbolo;
+import tools.Simbolo.clase_parametro;
+import tools.Simbolo.tipo_simbolo;
+import tools.Simbolo.tipo_variable;
+import tools.GenerarCodigo;
+
+import excepciones.YaExisteSimboloException;
+import excepciones.SimboloNoEncontradoException;
+
+public class minilengcompiler
+{
+
+  public enum TipoOperador { SUMA, RESTA, OR, MUL, DIV, MOD, AND, IGUAL, MAYOR, MENOR, MAYOR_IG, MENOR_IG, NO_IGUAL, NULL_OP };
+
+  public static int nivel = 0;
+  public static String nombreFichero;
+  public static Tabla_simbolos tablaSimbolos;
+  public static Tabla_verbose tablaVerbose;
+  public static List<Simbolo> parametrosAccionActual;
+  public static Simbolo accionActual = null;
+  public static int errLex = 0, errSin = 0, errSem = 0;
+  public static GenerarCodigo gCodigo;
+  public static int dir;
+  public static int stackFramePrograma;
+  public static String codigoExpresion;
+  public static Simbolo bloqueAccion = null;
+  
+  public static void main(String args []) throws ParseException, java.io.IOException { 
+    if(args.length < 1 || args.length > 2) {
+    	System.out.println("Parametros incorrectos. Sintaxis: ");
+    	System.out.println("./MiniLeng <nombreFichero>.ml [-v]");
+    	System.exit(0);
+    }
+
+    File archivo;
+    FileReader fr;
+    BufferedReader br;
+    minilengcompiler parser;
+    
+    try {
+        archivo = new File("src/"+args[0]);
+	    fr = new FileReader(archivo);
+	    br = new BufferedReader(fr);
+
+		tablaVerbose = new Tabla_verbose();					//Tabla para el modo verbose
+    	tablaSimbolos = new Tabla_simbolos();				//Tabla de simbolos
+		tablaSimbolos.inicializar_tabla();
+		codigoExpresion = "";								//Para guardar etiquetas en caso de expresión no constante
+		parametrosAccionActual = new ArrayList<Simbolo>();	//Para guardar parametros accion declarada
+		nombreFichero = args[0].substring(0, args[0].lastIndexOf("."));
+		
+
+		if(args.length == 2) {
+		  if(args[1].equals("-v")) {
+	      	tablaVerbose.setVerboseTable(true);
+	      }
+	      else {
+	        System.out.println("Parametros incorrectos. Sintaxis: ");
+    		System.out.println("./MiniLeng <nombreFichero>.ml [-v]");
+	        System.exit(0);
+	      }
+		}
+	    
+	    parser = new minilengcompiler(br);
+    	minilengcompiler.programa();
+
+    	if(errLex==0 && errSin==0 && errSem==0) {
+    	  if(tablaVerbose.getVerboseTable()) {
+	    	tablaVerbose.mostrar();
+	      }
+
+    	  System.out.println("Compilación finalizada. Se ha generado el fichero "+nombreFichero+".code");
+    	}
+    	else {
+    	  //Eliminamos el .code ya que no debe generarse si hay errores
+    	  gCodigo.eliminarFichero();
+    	}
+    }
+    catch (IOException e) {
+            System.out.println("Error al abrir el fichero: "+ e.getMessage());
+            System.out.println("Sintaxis: ./MiniLeng <nombreFichero>.ml [-v]");
+    }
+    catch (Exception e) { //Errores sintacticos. Estan en ParseException
+    	errSin++; //Se supone que aquí nunca debe llegar, se trata con las excepciones en las gramáticas
+		System.out.println("NOK.");
+        System.out.println(e.getMessage());
+	  	System.out.println(SimpleCharStream.getEndLine());
+	  	System.out.println(SimpleCharStream.getEndColumn());
+        minilengcompiler.ReInit(System.in);
+	}
+    catch (Error e) { //Errores lexicos. Estan en TokenMgrError
+        //Importante: los metodos getEndLine y tal son static, asi que para utilizarlos,
+        //no hay que hacer una instancia de un objeto, simplemente tienes que poner <nombreClase>.metodo()
+		try {
+		  	errLex++;
+			System.out.println("ERROR LÉXICO (" +
+				SimpleCharStream.getBeginLine() + ", " +
+				SimpleCharStream.getBeginColumn() + "): símbolo no reconocido: " +
+				SimpleCharStream.readChar()); //readChar debe ir en un try catch de IOException
+        }
+        catch (IOException IOe) {
+            //System.err.println("An IOException was caught :"+IOe.getMessage());
+            //Este catch es para los casos en los que no se cierra nunca un comentario del tipo %% ... %%
+            //o para carácteres extraños después de la palabra fin, por que si no muestra que el flujo ha sido cerrado
+            System.out.println("ERROR LÉXICO (" +
+				SimpleCharStream.getBeginLine() + ", " +
+				SimpleCharStream.getBeginColumn() + "): comentario no cerrado o símbolo no reconocido al finalizar programa"); 
+        }
+	}
+  }
+
+  /* TRATAMIENTO ERRORES */
+  /* SINTACTICO */
+  public static void errorSintactico(int line, int column, String msgError) {
+    errSin++;
+    System.out.println("ERROR SINTÁCTICO("+line+", "+column+"): "+msgError);
+  }
+
+  /* SEMANTICO */
+  public static void errorSemantico(int line, int column, String msgError) {
+    errSem++;
+    System.out.println("ERROR SEMÁNTICO("+line+", "+column+"): "+msgError);
+  }
+
+  public static void introducirSimboloPrograma (Token t) {
+    Simbolo s = tablaSimbolos.introducir_programa(t.toString(), dir);
+  }
+  
+  public static void  introducirSimboloVariable (Token t, tipo_variable tipoVar) {
+    try {
+      Simbolo s = tablaSimbolos.introducir_variable(t.toString(), tipoVar, nivel, dir);
+    }
+    catch (YaExisteSimboloException e){
+      errSem++;
+      System.out.println(e.getMessage());
+    }
+  }
+
+  public static Simbolo introducirSimboloAccion (Token t) {
+    try { 
+	  Simbolo s = tablaSimbolos.introducir_accion(t.toString(), nivel, dir);
+	  accionActual = s;
+	  return s;
+  	}
+  	catch (YaExisteSimboloException e){
+  	  errSem++;
+      System.out.println(e.getMessage());
+      return null;
+    }
+  }
+
+  public static void introducirSimboloParametro (Token t, tipo_variable tipoVar, clase_parametro claseP) {
+    try {
+      Simbolo s = tablaSimbolos.introducir_parametro(t.toString(), tipoVar, claseP, nivel, dir);
+      parametrosAccionActual.add(s);
+    }
+    catch(YaExisteSimboloException e) {
+      errSem++;
+      System.out.println(e.getMessage());
+    }
+  }
+
+  public static void actualizarListaParametros() {
+    if(accionActual != null) {
+      accionActual.setListaParametros(parametrosAccionActual);
+      parametrosAccionActual.clear();
+      accionActual = null;
+    }
+  }
+
+  public static Simbolo compruebaParametroValor(Token t) {
+    try {
+      Simbolo s = tablaSimbolos.buscar_simbolo(t.toString(), nivel);
+      if(s.es_valor()) {
+        errSem++;
+        System.out.println("ERROR SEMÁNTICO("+SimpleCharStream.getBeginLine()+
+					  ", "+SimpleCharStream.getBeginColumn()+"): El parámetro " + 
+					  s.getNombre() + " se ha pasado por valor y no puede ser modificado.");
+      }
+
+      return s;
+    }
+    catch (SimboloNoEncontradoException e){
+      errSem++;
+      System.out.println(e.getMessage());
+      return null;
+    }
+  }
+
+  //Para plasmar en la generacion de codigo una unica etiqueta constante si la expresion es constante
+  //o todo el conjunto de etiquetas correspondientes a la expresion
+  public static void codigoConstanteOExpresion(RegistroExpr expr, boolean esEscribir) {
+    if(expr!=null && expr.tipoSimbolo == tipo_simbolo.CONSTANTE) {
+      switch(expr.tipoVariable) {
+	    case ENTERO:
+	    		gCodigo.escribir("	STC   "+ expr.valorEnt);
+	    	break;
+	    	
+	    case BOOLEANO:
+	    		if(!esEscribir) {
+	    		  if(expr.valorBool) {
+	    		    gCodigo.escribir("	STC   1");
+	    		  }
+	    		  else {
+	    		    gCodigo.escribir("	STC   0");
+	    		  }
+	    		}
+	    	break;
+	    	
+	    case CHAR:
+	    		gCodigo.escribir("	STC   "+(int)expr.valorChar);
+	    	break;
+	    	
+	    default:
+	    	break;
+	  }
+    }
+    else {
+      if(codigoExpresion.length()>0) {
+        codigoExpresion = codigoExpresion.substring(0, codigoExpresion.length()-1);	//Para quitar solo el ultimo \n
+      	gCodigo.escribir(codigoExpresion);
+      }
+    }
+    codigoExpresion = "";	//reseteamos para nuevas expresiones
+  }
+  
+}
+
+PARSER_END(minilengcompiler)
+
+TOKEN_MGR_DECLS:
+{
+  	//En esta seccion, le pasas a la seccion de tokens las variables que quieras, para que las pueda usar
+	static boolean verbose = Tabla_verbose.getVerboseTable();
+}
+
+SKIP :
+{
+  " "
+| "\r"
+| "\t"
+| "\n"
+| "%%" : COMMENT2
+| "%" : COMMENT1
+}
+
+<COMMENT2> SKIP :
+{
+  "%%" : DEFAULT
+}
+<COMMENT2> MORE :
+{
+  < ~[] >
+}
+
+<COMMENT1> SKIP :
+{
+  "\n" : DEFAULT
+}
+<COMMENT1> MORE :
+{
+  < ~[] >
+}
+
+TOKEN : /* PALABRAS RESERVADAS */
+{
+  < tPROGRAMA : "programa" >
+  {if(verbose) Tabla_verbose.actualizar("programa");}
+| < tVAR : "var" >
+  {if(verbose) Tabla_verbose.actualizar("var");}
+| < tAND : "and" >
+  {if(verbose) Tabla_verbose.actualizar("and");}
+| < tOR : "or" >
+  {if(verbose) Tabla_verbose.actualizar("or");}
+| < tNOT : "not" >
+  {if(verbose) Tabla_verbose.actualizar("not");}
+| < tPRINCIPIO : "principio" >
+  {if(verbose) Tabla_verbose.actualizar("principio");}
+| < tFIN : "fin" >
+  {if(verbose) Tabla_verbose.actualizar("fin");}
+| < tSI : "si" >
+  {if(verbose) Tabla_verbose.actualizar("si");}
+| < tENT : "ent" >
+  {if(verbose) Tabla_verbose.actualizar("ent");}
+| < tSI_NO : "si_no" >
+  {if(verbose) Tabla_verbose.actualizar("si_no");}
+| < tFSI : "fsi" >
+  {if(verbose) Tabla_verbose.actualizar("fsi");}
+| < tMQ : "mq" >
+  {if(verbose) Tabla_verbose.actualizar("mq");}
+| < tFMQ : "fmq" >
+  {if(verbose) Tabla_verbose.actualizar("fmq");}
+| < tESCRIBIR : "escribir" >
+  {if(verbose) Tabla_verbose.actualizar("escribir");}
+| < tLEER : "leer" >
+  {if(verbose) Tabla_verbose.actualizar("leer");}
+| < tMOD : "mod" >
+  {if(verbose) Tabla_verbose.actualizar("mod");}
+| < tDIV : "div" >
+  {if(verbose) Tabla_verbose.actualizar("div");}
+| < tENTACAR : "entacar" >
+  {if(verbose) Tabla_verbose.actualizar("entacar");}
+| < tCARAENT : "caraent" >
+  {if(verbose) Tabla_verbose.actualizar("caraent");}
+| < tACCION : "accion" >
+  {if(verbose) Tabla_verbose.actualizar("accion");}
+| < tVAL : "val" >
+  {if(verbose) Tabla_verbose.actualizar("val");}
+| < tREF : "ref" >
+  {if(verbose) Tabla_verbose.actualizar("ref");}
+}
+
+TOKEN : /* TIPOS DE DATOS */
+{
+  < tENTERO : "entero" >
+  {if(verbose) Tabla_verbose.actualizar("entero");}
+| < tBOOLEANO : "booleano" >
+  {if(verbose) Tabla_verbose.actualizar("booleano");}
+| < tCARACTER : "caracter" >
+  {if(verbose) Tabla_verbose.actualizar("caracter");}
+}
+
+TOKEN : /* OPERADORES */
+{
+  < tMAYOR : ">" >
+  {if(verbose) Tabla_verbose.actualizar(">");}
+| < tMENOR : "<" >
+  {if(verbose) Tabla_verbose.actualizar("<");}
+| < tIGUAL : "=" >
+  {if(verbose) Tabla_verbose.actualizar("=");}
+| < tMAI : ">=" >
+  {if(verbose) Tabla_verbose.actualizar(">=");}
+| < tMEI : "<=" >
+  {if(verbose) Tabla_verbose.actualizar("<=");}
+| < tNI : "<>" >
+  {if(verbose) Tabla_verbose.actualizar("<>");}
+| < tOPAS : ":=" >
+  {if(verbose) Tabla_verbose.actualizar(":=");}
+| < tMAS : "+" >
+  {if(verbose) Tabla_verbose.actualizar("+");}
+| < tMENOS : "-" >
+  {if(verbose) Tabla_verbose.actualizar("-");}
+| < tPOR : "*" >
+  {if(verbose) Tabla_verbose.actualizar("*");}
+| < tDIV2 : "/" >
+  {if(verbose) Tabla_verbose.actualizar("/");}
+| < tCOMA : "," >
+  {if(verbose) Tabla_verbose.actualizar(",");}
+| < tFIN_SENTENCIA : ";" >
+  {if(verbose) Tabla_verbose.actualizar(";");}
+}
+
+TOKEN : /* AGRUPACIONES */
+{
+  <  tPARAB : "(" >
+  {if(verbose) Tabla_verbose.actualizar("(");}
+| <  tPARCE : ")" >
+  {if(verbose) Tabla_verbose.actualizar(")");}
+}
+
+TOKEN : /* VALORES */
+{
+  < tTRUE : "true" >
+  {if(verbose) Tabla_verbose.actualizar("valorBooleano");}
+| < tFALSE : "false" >
+  {if(verbose) Tabla_verbose.actualizar("valorBooleano");}
+| < tIDENTIFICADOR : ((<LETRA>|"_") (<LETRA>|"_"|<DIGITO>)* (<LETRA>|<DIGITO>)) | <LETRA> >
+  {if(verbose) Tabla_verbose.actualizar("identificador");}
+| <  tCONSTENTERO : (["0"-"9"])+ >
+  {if(verbose) Tabla_verbose.actualizar("valorEntero");}
+| < tCONSTCHAR : ("\"")(~[])("\"") >
+  {if(verbose) Tabla_verbose.actualizar("valorCaracter");}
+| < tCONSTCAD : ("\"")(~["\""])*("\"") >
+  {if(verbose) Tabla_verbose.actualizar("valorCadena");}
+| < #LETRA: ["a"-"z"] >
+| < #DIGITO: ["0"-"9"] >
+}
+
+/* GRAMATICA MINILENG */
+// Programa ::= <tPROGRAMA> <tIDENTIFICADOR> ";"
+// 				declaracion_variables declaracion_acciones
+// 				bloque_sentencias <EOF>
+void programa() throws FileNotFoundException:
+{
+  Token t1 = null;
+  String etiq;
+}
+{
+	try {
+		<tPROGRAMA> t1 = <tIDENTIFICADOR> <tFIN_SENTENCIA>
+			{
+			  dir=3;
+			  introducirSimboloPrograma(t1);
+			  
+			  gCodigo = new GenerarCodigo(nombreFichero);
+			  etiq=gCodigo.nueva_etiqueta();
+			  gCodigo.escribir("; Programa "+t1.image.toUpperCase()+".");
+			  gCodigo.escribir("	ENP "+etiq);
+			}
+			
+			declaracion_variables()
+
+			{
+			  stackFramePrograma = dir-1;
+			}
+			
+			declaracion_acciones()
+			
+			{
+			  gCodigo.escribir("; Comienzo del programa "+(t1.image).toUpperCase()+".");
+			  gCodigo.escribir(etiq+":");
+			}
+			
+			bloque_sentencias()
+			
+			{
+			  gCodigo.escribir("; Fin del programa "+(t1.image).toUpperCase()+".");
+			  gCodigo.escribir("	LVP");
+			  gCodigo.cerrar();
+			  
+			  //tablaSimbolos.mostrarTabla();
+			}
+			<EOF>
+	} catch(ParseException e) {
+	  	String msgError="Estructura incorrecta. Se espera cabecera programa, variables, acciones y sentencias.";
+		minilengcompiler.errorSintactico(SimpleCharStream.getEndLine(), SimpleCharStream.getEndColumn(), msgError);
+	}
+}
+
+// declaracion_variables ::= ( declaracion ";" )*
+void declaracion_variables() :
+{}
+{
+ 	try {
+		(declaracion() <tFIN_SENTENCIA>)*
+	} catch(ParseException e) {
+	  	String msgError="Se espera token \";\" o \",\" para separar."; //No se si esta bien, si falla aqui no se si va a ser siempre por el ;
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// declaracion ::= tipo_variables identificadores
+void declaracion() :
+{
+	tipo_variable tipoVariable;
+}
+{
+ 	try {
+		tipoVariable = tipo_variables()
+		identificadores(tipoVariable, null)
+	} catch(ParseException e) {
+	  	String msgError="Se espera tipo de variable seguido de identificadores.";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// tipo_variables ::= <tENTERO> | <tCARACTER> | <tBOOLEANO>
+tipo_variable tipo_variables() :
+{}
+{
+ 	try {
+		<tENTERO> { return tipo_variable.ENTERO; }
+		| <tCARACTER> { return tipo_variable.CHAR; }
+		| <tBOOLEANO> { return tipo_variable.BOOLEANO; }
+	} catch(ParseException e) {
+	  	String msgError="Se espera tipo de variable, \"entero\", \"booleano\" o \"caracter\"";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+		return tipo_variable.NULL_V;
+	}
+}
+
+// identificadores ::= <tIDENTIFICADOR> ( "," <tIDENTIFICADOR> )*
+void identificadores(tipo_variable tipoVariable, clase_parametro claseParametro) :
+{
+	Token t1, t2 = null;
+	Simbolo sLeer = null, sLeer2 = null;
+}
+{
+ 	try {
+		t1 = <tIDENTIFICADOR>
+		{
+		  if(tipoVariable != null && claseParametro == null) { //variable
+		    introducirSimboloVariable(t1, tipoVariable);
+		    dir++;
+		  }
+		  else if(tipoVariable != null && claseParametro != null) { //parametro
+		    introducirSimboloParametro(t1, tipoVariable, claseParametro);
+		    dir++;
+		  }
+		  else {	//lista asignables de sentencia leer
+		  	sLeer = compruebaParametroValor(t1); //Comprueba si es un parametro por valor y tambien si el ident. ha sido declarado
+
+		  	if(sLeer!=null) {
+		  	  if((sLeer.getTipo() != tipo_simbolo.VARIABLE) && (sLeer.getTipo() != tipo_simbolo.PARAMETRO)) {
+			    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+		  	   								    SimpleCharStream.getBeginColumn(),
+	    				 					    "No se le puede pasar un tipo "+sLeer.getTipo()+" a la operacion leer");
+			  }
+			  else if((sLeer.getVariable()!=tipo_variable.ENTERO) && (sLeer.getVariable()!=tipo_variable.CHAR)) {
+			    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+		  	   								    SimpleCharStream.getBeginColumn(),
+	    				 					    "La operación leer solo admite variables o parámetros de tipo ENTERO o CARACTER");
+			  }
+
+			  gCodigo.escribir("; Leer.");
+			  int f = nivel - sLeer.getNivel();
+			  int o = sLeer.getDir();
+			  gCodigo.escribir("	SRF   "+f+"  "+o);
+			  if(sLeer.es_referencia()) {
+				  gCodigo.escribir("	DRF");
+				}
+			  
+			  if(sLeer.getVariable()==tipo_variable.ENTERO) {
+			    gCodigo.escribir("	RD   1");
+			  }
+			  else if(sLeer.getVariable()==tipo_variable.CHAR) {
+			    gCodigo.escribir("	RD   0");
+			  }
+		  	}
+		  }
+		}
+		(<tCOMA> t2 = <tIDENTIFICADOR>
+		{
+		  if(tipoVariable != null && claseParametro == null) { //variable
+		    introducirSimboloVariable(t2, tipoVariable);
+		    dir++;
+		  }
+		  else if(tipoVariable != null && claseParametro != null) { //parametro
+		    introducirSimboloParametro(t2, tipoVariable, claseParametro);
+		    dir++;
+		  }
+		  else {	//lista asignables de sentencia leer
+		    sLeer2 = compruebaParametroValor(t2); //Comprueba si es un parametro por valor y tambien si el ident. ha sido declarado
+
+		    if(sLeer2!=null) {
+		      if((sLeer2.getTipo() != tipo_simbolo.VARIABLE) && (sLeer2.getTipo() != tipo_simbolo.PARAMETRO)) {
+			    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+		  	   								    SimpleCharStream.getBeginColumn(),
+	    				 					    "No se le puede pasar un tipo "+sLeer2.getTipo()+" a la operacion leer");
+			  }
+			  else if((sLeer2.getVariable()!=tipo_variable.ENTERO) && (sLeer2.getVariable()!=tipo_variable.CHAR)) {
+			    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+		  	   								    SimpleCharStream.getBeginColumn(),
+	    				 					    "La operación leer solo admite variables o parámetros de tipo ENTERO o CARACTER");
+			  }
+
+			  gCodigo.escribir("; Leer.");
+			  int f = nivel - sLeer2.getNivel();
+			  int o = sLeer2.getDir();
+			  gCodigo.escribir("	SRF   "+f+"  "+o);
+			  if(sLeer2.es_referencia()) {
+				  gCodigo.escribir("	DRF");
+				}
+			  
+			  if(sLeer2.getVariable()==tipo_variable.ENTERO) {
+			    gCodigo.escribir("	RD   1");
+			  }
+			  else if(sLeer2.getVariable()==tipo_variable.CHAR) {
+			    gCodigo.escribir("	RD   0");
+			  }
+		    }
+		  }
+		}
+		)*
+	} catch(ParseException e) {
+	  	String msgError="Se espera una variable con identificador válido o \",\" para separar";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// declaracion_acciones ::= ( declaracion_accion )*
+void declaracion_acciones() :
+{}
+{
+	try {
+		(declaracion_accion())*
+	} catch(ParseException e) {
+	  	String msgError="Error al declarar acción";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// declaracion_accion ::= cabecera_accion ";"
+//						  declaracion_variables declaracion_acciones
+//						  bloque_sentencias
+void declaracion_accion() :
+{
+	Token t1 = null;
+	String etiq;
+	Simbolo s = null;
+}
+{
+	try {
+		s = cabecera_accion() <tFIN_SENTENCIA>
+		{
+		  actualizarListaParametros();
+		}
+		declaracion_variables()
+
+		{
+		  if(s!=null) {
+			s.setValorStackFrame(dir-1);
+		  }
+		}
+		
+		declaracion_acciones()
+
+		{
+		  if(s!=null) {
+		    etiq = gCodigo.nueva_etiqueta();
+		    s.setEtiqueta(etiq);
+		  	gCodigo.escribir("; Acción "+(s.getNombre()).toUpperCase()+".");
+			gCodigo.escribir(etiq+":");
+			gCodigo.escribir("; Comienzo de la acción "+(s.getNombre()).toUpperCase()+".");
+
+			int dirComienzo = 2 + s.getListaParametros().size();
+			for(int i=0; i<s.getListaParametros().size(); i++) {
+			  gCodigo.escribir("	SRF   "+0+"  "+dirComienzo);
+			  gCodigo.escribir("	ASGI");
+			  dirComienzo--;
+			}
+
+			bloqueAccion = s;
+		  }
+		}
+		bloque_sentencias()
+		{
+		  
+		  tablaSimbolos.eliminar_variables(nivel);
+		  tablaSimbolos.eliminar_acciones(nivel);
+		  tablaSimbolos.ocultar_parametros(nivel);	//Ocultas los parametros de la accion
+		  tablaSimbolos.eliminar_parametros_ocultos(nivel+1);	//Eliminas los parametros de las acciones anidadas, no los de esta
+		  nivel = nivel - 1;
+
+		  if(s!=null) {
+		    gCodigo.escribir("; Fin de la acción "+(s.getNombre()).toUpperCase());
+		  	gCodigo.escribir("	CSF");
+		  	bloqueAccion = null;
+		  }
+		  
+		}
+	} catch(ParseException e) {
+	  	String msgError="Error al declarar acción. Recuerde \";\" al final";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// cabecera_accion ::= <tACCION> <tIDENTIFICADOR> parametros_formales
+Simbolo cabecera_accion() :
+{
+  	Token t1 = null;
+	Simbolo s = null;
+}
+{
+	try {
+		<tACCION> t1 = <tIDENTIFICADOR>
+		{
+		  	s = introducirSimboloAccion(t1);
+			nivel = nivel + 1;
+			dir = 3;
+		}
+		parametros_formales()
+
+		{ return s; }
+	} catch(ParseException e) {
+	  	String msgError="Identificador de acción no valido";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+		return null;
+	}
+}
+
+// parametros_formales ::= ( "(" ( parametros (";" parametros)* )? ")" )?
+void parametros_formales() :
+{}
+{
+	try {
+		(<tPARAB> (parametros() (<tFIN_SENTENCIA> parametros())* )? <tPARCE>)?
+	} catch(ParseException e) {
+	  	String msgError="Argumentos incorrectamente especificados, parentesis o \";\" no incluidos";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// lista_parametros ::= identificadores
+void lista_parametros(tipo_variable tipoVariable, clase_parametro claseParametro) :
+{}
+{
+	try {
+		identificadores(tipoVariable, claseParametro)
+	} catch(ParseException e) {
+	  	String msgError="Se espera lista de nombres de variable";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+
+}
+
+// parametros ::= clase_parametros tipo_variables lista_parametros
+void parametros() :
+{
+  tipo_variable tipoVariable;
+  clase_parametro claseParametro;
+}
+{
+	try {
+		claseParametro=clase_parametros() tipoVariable=tipo_variables() lista_parametros(tipoVariable, claseParametro)
+	} catch(ParseException e) {
+	  	String msgError="Se espera clase de parámetro seguido de tipo de variable e identificadores";
+		minilengcompiler.errorSintactico( SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// clase_parametros ::= <tVAL> | <tREF>
+clase_parametro clase_parametros() :
+{}
+{
+	try {
+		<tVAL> { return clase_parametro.VAL; }
+		| <tREF> { return clase_parametro.REF; }
+	} catch(ParseException e) {
+	  	String msgError="Se espera token \"ref\" o \"val\", o cerrar paréntesis";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+		return clase_parametro.NULL_P;
+	}
+}
+
+// bloque_sentencias ::= <tPRINCIPIO> lista_sentencias <tFIN>
+void bloque_sentencias() :
+{}
+{
+ 	try {
+		<tPRINCIPIO> lista_sentencias() <tFIN>
+	} catch(ParseException e) {
+	  	String msgError="Variable, acción o bloque sentencias no declarados correctamente.";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// lista_sentencias ::= ( sentencia )+
+void lista_sentencias() :
+{}
+{
+ 	try {
+		(sentencia())+
+	} catch(ParseException e) {
+	  	String msgError="Al menos debe haber una instrucción";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// sentencia ::= leer ";" | escribir ";" | <tIDENTIFICADOR> asigna_o_invoca | seleccion | mientras_que
+void sentencia() :
+{
+	Token t1 = null;
+}
+{
+ 	try {
+			leer() <tFIN_SENTENCIA>
+		| 	escribir() <tFIN_SENTENCIA>
+		| 	t1 = <tIDENTIFICADOR> asigna_o_invoca(t1)
+		| 	seleccion()
+		| 	mientras_que()
+	} catch(ParseException e) {
+	  	String msgError="Se espera una instrucción válida. Recuerde \";\" al finalizar instrucción";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// leer ::= <tLEER> "(" lista_asignables ")"
+void leer() :
+{}
+{
+ 	try {
+		<tLEER> <tPARAB> lista_asignables() <tPARCE>
+	} catch(ParseException e) {
+	  	String msgError="Error en instrucción leer. Se espera paréntesis o lista de variables válidas. No expresiones";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// lista_asignables ::= identificadores
+void lista_asignables() :
+{}
+{
+ 	try {
+ 	  	// Parametros null, null para que la funcion identificadores sepa que se trata
+ 	  	// del caso leer
+		identificadores(null, null)
+	} catch(ParseException e) {
+	  	String msgError="Se espera nombre variable válido";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// escribir ::= <tESCRIBIR> "(" lista_escribibles ")"
+void escribir() :
+{}
+{
+ 	try {
+		<tESCRIBIR> <tPARAB> lista_escribibles() <tPARCE>
+	} catch(ParseException e) {
+	  	String msgError="Error en instrucción escribir. Se espera paréntesis, comillas dobles o lista expresiones válidas";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// lista_escribibles ::= lista_expresiones
+void lista_escribibles() :
+{
+	List<RegistroExpr> lExpr = null;
+}
+{
+ 	try {
+ 	  	{
+ 	  	  gCodigo.escribir("; Escribir.");
+ 	  	}
+		lExpr = lista_expresiones(null, false, true)
+	} catch(ParseException e) {
+	  	String msgError="Se espera lista expresiones válida";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// asigna_o_invoca ::= asignacion | invocacion_accion
+void asigna_o_invoca(Token t) :
+{}
+{
+ 	try {
+		asignacion(t) | invocacion_accion(t)
+	} catch(ParseException e) {
+	  	String msgError="Instrucción no válida";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// asignacion ::= <tOPAS> expresion ";"
+void asignacion(Token t) :
+{
+  	Simbolo s = null;
+	tipo_variable tpID = null;
+	RegistroExpr expr = null;
+}
+{
+ 	try {
+		<tOPAS>
+		
+		{
+		  //Comprueba si es un parametro por valor y además si ha sido declarado antes
+		  s = compruebaParametroValor(t);
+		  if(s != null) {
+		    if((s.getTipo() != tipo_simbolo.VARIABLE) && (s.getTipo() != tipo_simbolo.PARAMETRO)) {
+			  minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+		  	   								   SimpleCharStream.getBeginColumn(),
+	    				 					   "No se le puede asignar nada a un simbolo de tipo "+s.getTipo()+". Se espera variable o parametro por referencia");
+			  tpID = tipo_variable.DESCONOCIDO;
+			}
+			else {
+			  tpID = s.getVariable();
+			}
+
+			gCodigo.escribir("; Dirección de la variable "+t.image.toUpperCase()+".");
+			int f = nivel - s.getNivel();
+			int o = s.getDir();
+			gCodigo.escribir("	SRF   "+f+"  "+o);
+			if(s.es_referencia()) {
+			  gCodigo.escribir("	DRF");
+			}		
+		  }
+		  else {
+		    tpID = tipo_variable.DESCONOCIDO;
+		  }
+		}
+		
+		expr = expresion(null, false)
+
+		{
+		  codigoConstanteOExpresion(expr, false);
+		  if(expr!=null) {
+		   	  if((tpID != tipo_variable.DESCONOCIDO) && (expr.tipoVariable != tipo_variable.DESCONOCIDO) &&
+			  	 (tpID != expr.tipoVariable)) {
+			  	   minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+			  	   								   SimpleCharStream.getBeginColumn(),
+		    				 					   "Tipos incompatibles en la asignación");
+			  }
+			  else if(expr.tipoSimbolo==tipo_simbolo.CONSTANTE && expr.tipoVariable==tipo_variable.ENTERO
+			  		  && expr.valorEnt > 32000) {
+			    	minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+			  	   								   SimpleCharStream.getBeginColumn(),
+		    				 					   "Valor entero fuera de rango");
+			  }
+		  }
+		}
+		
+		<tFIN_SENTENCIA>
+
+		{
+			gCodigo.escribir("; Asignación.");
+			gCodigo.escribir("	ASG");
+		}
+	} catch(ParseException e) {
+	  	String msgError="Se espera expresión válida o token \";\"";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// invocacion_accion ::= ( argumentos )? ";"
+void invocacion_accion(Token t) :
+{
+  Simbolo s = null;
+  String etiqInvocar;
+  int stackFrame, l;
+  boolean hayArgumentos = false;
+}
+{
+ 	try {
+ 	  	{
+ 	  	  try {
+		    s = tablaSimbolos.buscar_simbolo(t.toString(), tipo_simbolo.ACCION);
+
+		    gCodigo.escribir("; Invocación a "+(s.getNombre()).toUpperCase());
+		  }
+		  catch (SimboloNoEncontradoException e){
+		    errSem++;
+		    System.out.println(e.getMessage());
+		  }
+
+		  if(s!=null && !s.es_accion()) {
+		    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+		  	   								   SimpleCharStream.getBeginColumn(),
+	    				 					   s.getNombre()+" no puede ser utilizado como acción");
+		  }
+ 	  	}
+ 	  	
+		(argumentos(s) { hayArgumentos=true;})? <tFIN_SENTENCIA>
+
+		{
+		  //Si se ha invocado a la funcion sin parametros, el analizador no ha entrado en (argumentos(s))?,
+		  //y por tanto no ha hecho la comprobacion de si efectivamente esa funcion no tiene parametros
+		  if(s!=null && !hayArgumentos && (s.getListaParametros().size())!=0) {
+		    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+		  	   								   SimpleCharStream.getBeginColumn(),
+	    				 					   "Se esperaba(n) "+s.getListaParametros().size()+" parámetro(s) al invocar la acción "
+	    				 					   +s.getNombre()+". Se han encontrado 0 parametros");
+		  }
+		}
+
+		{
+		  //OSF
+		  if(s!=null && s.es_accion()) {
+			if(nivel==0) {	//Invocacion desde el programa principal
+		    	stackFrame=stackFramePrograma;
+		  	}
+		  	else {
+		  	  	stackFrame=bloqueAccion.getValorStackFrame();
+		  	}
+		  	l = nivel - s.getNivel();
+		  	etiqInvocar = s.getEtiqueta();
+
+		  	gCodigo.escribir("	OSF	  "+stackFrame+"	 "+l+"	 "+etiqInvocar); 
+		  }
+		}
+		
+	} catch(ParseException e) {
+	  	String msgError="Declaración argumentos no válida. Recuerde también \";\" al finalizar";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// mientras_que ::= <tMQ> expresion lista_sentencias <tFMQ>
+void mientras_que() :
+{
+  RegistroExpr expr = null;
+  String etiqMQ, etiqFin;
+}
+{
+ 	try {
+		<tMQ>
+		{
+		  	etiqMQ = gCodigo.nueva_etiqueta();
+			gCodigo.escribir(etiqMQ+":");
+			gCodigo.escribir("; MQ");
+		}
+
+		expr = expresion(null, false)
+		{
+		  	codigoConstanteOExpresion(expr, false);
+		  	if(expr!=null) { 
+		  	  	if((expr.tipoVariable != tipo_variable.DESCONOCIDO) && (expr.tipoVariable != tipo_variable.BOOLEANO)) {
+				  minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+			  	   								   SimpleCharStream.getBeginColumn(),
+		    				 					   "La condición en el mientras_que debe ser un booleano");
+				}
+		  	}
+
+			gCodigo.escribir("; Salir del bucle si la guarda se evalúa a falso.");
+			etiqFin = gCodigo.nueva_etiqueta();
+			gCodigo.escribir("	JMF   "+etiqFin);
+			
+		}
+		
+		lista_sentencias() <tFMQ>
+
+		{
+		  	gCodigo.escribir("; Fin de la iteración. Saltar a la cabecera del bucle.");
+		  	gCodigo.escribir("	JMP   "+etiqMQ);
+			gCodigo.escribir(etiqFin+":");
+			gCodigo.escribir("; Fin MQ.");
+		}
+	} catch(ParseException e) {
+	  	String msgError="Error en instrucción mq. Se espera mq <expresión> <lista_sentencias> fmq";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// seleccion ::= <tSI> expresion <tENT> lista_sentencias ( <tSI_NO> lista_sentencias )? <tFSI>
+void seleccion() :
+{
+	RegistroExpr expr = null;
+	String etiqSINO="", etiqFIN="";
+	boolean haySI_NO = false;
+}
+{
+ 	try {
+		<tSI>
+		{
+		  gCodigo.escribir("; SI.");
+		}
+
+		expr = expresion(null, false)
+		
+		{
+		  codigoConstanteOExpresion(expr, false);
+
+		  if(expr!=null) {
+		      if((expr.tipoVariable != tipo_variable.DESCONOCIDO) && (expr.tipoVariable != tipo_variable.BOOLEANO)) {
+				  minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+			  	   								   SimpleCharStream.getBeginColumn(),
+		    				 					   "La condición en la selección debe ser un booleano");
+			  }
+		  }
+
+		  etiqSINO = gCodigo.nueva_etiqueta();
+		  gCodigo.escribir("	JMF   "+etiqSINO);
+
+			
+		}
+		<tENT>
+
+		{
+		  gCodigo.escribir("; ENT.");
+		}
+
+		lista_sentencias()
+
+		(<tSI_NO>
+
+		{
+			haySI_NO = true;
+			etiqFIN = gCodigo.nueva_etiqueta();
+			gCodigo.escribir("	JMP   "+etiqFIN);
+		  	gCodigo.escribir(etiqSINO+":");
+		  	gCodigo.escribir("; SI_NO.");
+			
+		}
+
+		lista_sentencias())? <tFSI>
+
+		{
+		  if(haySI_NO) {
+		    gCodigo.escribir(etiqFIN+":");
+		  }
+		  else {
+		    gCodigo.escribir(etiqSINO+":");
+		  }
+		  gCodigo.escribir("; Fin SI.");
+		}
+	} catch(ParseException e) {
+	  	String msgError="Error en instrucción de selección";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// El parametro s guarda el simbolo de la accion que se esta invocando
+// argumentos ::= "(" ( lista_expresiones )? ")"
+void argumentos(Simbolo s) :
+{
+	List<RegistroExpr> lExpr = null;
+	List<Simbolo> lAccion = null;
+}
+{
+ 	try {
+ 	  {
+ 	    if(s!=null) {
+ 	      lAccion = s.getListaParametros();
+ 	    }
+ 	    //Para pasarle a lista_expresioneS() la lista de parametros de la accion,
+ 	    //puesto que si es un parametro por referencia, no hay que escribir la etiqueta
+ 	    //DRF, ya que solo queremos la direccion
+ 	  }
+	  <tPARAB> ( lExpr = lista_expresiones(lAccion, true, false))? <tPARCE>
+	  { 
+	    if(s!=null) {
+	      int numP = lAccion.size();
+		  if((lExpr==null) && (numP != 0)) {
+		    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+		  	   								   SimpleCharStream.getBeginColumn(),
+	    				 					   "Se esperaba(n) " +numP+ " parametro(s) al invocar la acción "+s.getNombre());
+		  }
+		  else if(lExpr!=null) {
+		    if(numP != lExpr.size()) {
+			  minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+				  	   						  SimpleCharStream.getBeginColumn(),
+			    				 			  "Se esperaba(n) " +numP+ " parámetro(s) al invocar la acción "+s.getNombre()
+			    				 			  + ". Se ha(n) encontrado "+lExpr.size()+" parametro(s)");
+			}
+			else {
+			  Iterator<Simbolo> lAccionIter = lAccion.iterator();
+			  Iterator<RegistroExpr> lExprIter = lExpr.iterator();
+
+			  Simbolo sAccion;
+			  RegistroExpr regExpr;
+			  while(lAccionIter.hasNext()) {
+			    sAccion = lAccionIter.next();
+			    regExpr = lExprIter.next();
+
+				if(regExpr!=null) {
+				  if(sAccion.getVariable() != regExpr.tipoVariable) {
+				      minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+					  	   						  	  SimpleCharStream.getBeginColumn(),
+				    				 			  	  "Argumento incorrecto. Se espera argumento de tipo "+sAccion.getVariable());
+				  }
+				  else if(sAccion.es_referencia() && regExpr.tipoSimbolo != tipo_simbolo.VARIABLE && regExpr.tipoSimbolo != tipo_simbolo.PARAMETRO){
+				      minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+					  	   						  	  SimpleCharStream.getBeginColumn(),
+				    				 			  	  "Se espera argumento por referencia. Debe ser una variable o un parametro por referencia");
+				  }
+				  else if(sAccion.es_referencia() && (regExpr.tipoSimbolo == tipo_simbolo.PARAMETRO && regExpr.tipoParam == clase_parametro.VAL) ) {
+				      minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+					  	   						  	  SimpleCharStream.getBeginColumn(),
+				    				 			  	  "Se espera argumento por referencia. Debe ser una variable o un parametro por referencia");
+				  }
+				}
+			  }
+			}
+		  }
+	    }
+	  }
+	}catch(ParseException e) {
+	  	String msgError="Se espera paréntesis o lista de expresiones válidas";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+	}
+}
+
+// lista_expresiones ::= expresion ( "," expresion )*
+List<RegistroExpr> lista_expresiones(List<Simbolo> pamsAccion, boolean esInvocacion, boolean esEscribir) :
+{
+	RegistroExpr r1 = null, r2 = null, regResult = null;
+	List<RegistroExpr> resul = null;
+	Simbolo s = null;
+	Iterator<Simbolo> pamsAccionIter = null;
+	if(esInvocacion && pamsAccion!=null) {
+	  pamsAccionIter = pamsAccion.iterator();
+	}
+}
+{
+ 	try {
+
+ 	  	{
+ 	  	  if (esInvocacion && pamsAccion!=null) {
+ 	  	  	if(pamsAccionIter.hasNext()) {
+	 	  	  s = pamsAccionIter.next();
+	 	  	}
+ 	  	  }
+ 	  	}
+		r1 = expresion(s, esInvocacion)
+		
+		{
+		  	codigoConstanteOExpresion(r1, esEscribir);
+		  	
+			resul = new ArrayList<RegistroExpr>();
+			resul.add(r1);
+
+			if(r1!=null && r1.tipoSimbolo==tipo_simbolo.CONSTANTE && r1.tipoVariable==tipo_variable.ENTERO
+			  		  && r1.valorEnt > 32000) {
+			    	minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+			  	   								   SimpleCharStream.getBeginColumn(),
+		    				 					   "Valor entero fuera de rango");
+			}
+			else if(r1!=null && esEscribir) {
+				  if(r1.tipoVariable == tipo_variable.CHAR) {
+				    gCodigo.escribir("	WRT   0");
+				  }
+				  else if(r1.tipoVariable == tipo_variable.CADENA){
+				  	String cad=(r1.valorCadena).substring(1,(r1.valorCadena).length()-1);	//Para no escribir las " "
+				  	gCodigo.escribir("; cadena '"+cad+"'.");
+				  	for(int i=1; i<(r1.valorCadena).length()-1	; i++) {
+				    	gCodigo.escribir("	STC   "+ (int)(r1.valorCadena).charAt(i));
+				    	gCodigo.escribir("	WRT   0");
+				  	}
+				  }
+				  else if(r1.tipoVariable == tipo_variable.BOOLEANO && r1.tipoSimbolo == tipo_simbolo.CONSTANTE) {
+				    String cad="";
+				    if(r1.valorBool) {
+				      cad = "Verdadero";
+				    }
+				    else {
+				      cad = "Falso";
+				    }
+				  	for(int i=0; i<cad.length(); i++) {
+				    	gCodigo.escribir("	STC   "+ (int)(cad).charAt(i));
+				    	gCodigo.escribir("	WRT   0");
+				  	}
+				  }
+				  else {
+				    gCodigo.escribir("	WRT   1");
+				  }
+			}
+			
+		}
+		
+		(<tCOMA>
+		
+		{
+			if (esInvocacion && pamsAccion!=null) {
+	 	  	  	if(pamsAccionIter.hasNext()) {
+		 	  	  s = pamsAccionIter.next();
+		 	  	}
+	 	  	  }
+		}
+		
+		r2 = expresion(s, esInvocacion)
+		
+		{
+		  	codigoConstanteOExpresion(r2, esEscribir);
+		  	
+			resul.add(r2);
+
+			if(r2!=null && r2.tipoSimbolo==tipo_simbolo.CONSTANTE && r2.tipoVariable==tipo_variable.ENTERO
+			  		  && r2.valorEnt > 32000) {
+			    	minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+			  	   								   SimpleCharStream.getBeginColumn(),
+		    				 					   "Valor entero fuera de rango");
+			}
+			else if(r2!=null && esEscribir) {
+			  if(r2.tipoVariable == tipo_variable.CHAR) {
+			    gCodigo.escribir("	WRT   0");
+			  }
+			  else if (r2.tipoVariable == tipo_variable.CADENA){
+			    String cad=(r2.valorCadena).substring(1,(r2.valorCadena).length()-1);	//Para no escribir las " "
+			  	gCodigo.escribir("; cadena '"+cad+"'.");
+			  	for(int i=1; i<(r2.valorCadena).length()-1	; i++) {
+			    	gCodigo.escribir("	STC   "+ (int)(r2.valorCadena).charAt(i));
+			    	gCodigo.escribir("	WRT   0");
+			  	}
+			  }
+			  else if(r2.tipoVariable == tipo_variable.BOOLEANO && r2.tipoSimbolo == tipo_simbolo.CONSTANTE) {
+			    String cad="";
+			    if(r2.valorBool) {
+			      cad = "Verdadero";
+			    }
+			    else {
+			      cad = "Falso";
+			    }
+			  	for(int i=0; i<cad.length(); i++) {
+			    	gCodigo.escribir("	STC   "+ (int)(cad).charAt(i));
+			    	gCodigo.escribir("	WRT   0");
+			  	}
+			  }
+			  else {
+			    gCodigo.escribir("	WRT   1");
+			  }
+			}
+		}
+		
+		)*
+
+		{
+		  	return resul;
+		}
+	} catch(ParseException e) {
+	  	String msgError="Se espera expresión válida o \",\" para separar";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+		return null;
+	}
+}
+
+// expresion ::= expresion_simple ( operador_relacional expresion_simple )*
+RegistroExpr expresion(Simbolo sRef, boolean esInvocacion) :
+{
+	RegistroExpr r1 = null, r2 = null, regResult = null;
+	TipoOperador op;
+	//Boolean ok;
+}
+{
+ 	try {
+		r1 = expresion_simple(sRef, esInvocacion)
+		(
+		  op = operador_relacional()
+		  r2 = expresion_simple(null, false)
+		  {
+		    if(r1!=null && r2!=null) {
+			    regResult = new RegistroExpr();
+			    
+			    if((r1.tipoVariable != r2.tipoVariable)  || (r1.tipoVariable == tipo_variable.DESCONOCIDO || r2.tipoVariable == tipo_variable.DESCONOCIDO)) {
+			      //Si no son iguales, o si alguno de los dos es desconocido
+			      minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+		    				 "Los operandos no son del mismo tipo");
+		    	  regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+		    	  regResult.tipoSimbolo = tipo_simbolo.EXPRESION;
+			    }
+			    else {
+			      if((r1.tipoSimbolo==tipo_simbolo.CONSTANTE) && (r2.tipoSimbolo==tipo_simbolo.CONSTANTE)) {
+			        regResult.tipoVariable = tipo_variable.BOOLEANO;
+			        regResult.tipoSimbolo = tipo_simbolo.CONSTANTE;
+						switch(r1.tipoVariable) {
+					    case ENTERO:
+					    	switch(op) {
+					    	  case MAYOR:
+					    	  	regResult.valorBool = r1.valorEnt > r2.valorEnt;
+					    	  	codigoExpresion += "	GT\n";
+					    	  	break;
+					    	  case MENOR:
+					    	  	regResult.valorBool = r1.valorEnt < r2.valorEnt;
+					    	  	codigoExpresion += "	LT\n";
+					    	  	break;
+					    	  case MAYOR_IG:
+					    	  	regResult.valorBool = r1.valorEnt >= r2.valorEnt;
+					    	  	codigoExpresion += "	GTE\n";
+					    	  	break;
+					    	  case MENOR_IG:
+					    	  	regResult.valorBool = r1.valorEnt <= r2.valorEnt;
+					    	  	codigoExpresion += "	LTE\n";
+					    	  	break;
+					    	  case IGUAL:
+					    	  	regResult.valorBool = r1.valorEnt == r2.valorEnt;
+					    	  	codigoExpresion += "	EQ\n";
+					    	  	break;
+					    	  case NO_IGUAL:
+					    	  	regResult.valorBool = r1.valorEnt != r2.valorEnt;
+					    	  	codigoExpresion += "	NEQ\n";
+					    	  	break;
+					    	  default:
+					    	  	break;
+					    	}
+					    	break;
+		
+					    case CADENA:
+					    	  switch(op) {
+					    	  /*case MAYOR:
+					    	  	regResult.valorBool = r1.valorCadena > r2.valorCadena;
+					    	  	break;
+					    	  case MENOR:
+					    	  	regResult.valorBool = r1.valorCadena < r2.valorCadena;
+					    	  	break;
+					    	  case MAYOR_IG:
+					    	  	regResult.valorBool = r1.valorCadena >= r2.valorCadena;
+					    	  	break;
+					    	  case MENOR_IG:
+					    	  	regResult.valorBool = r1.valorCadena <= r2.valorCadena;
+					    	  	break;*/
+					    	  case IGUAL:
+					    	  	regResult.valorBool = (r1.valorCadena).equals(r2.valorCadena);
+					    	  	codigoExpresion += "	EQ\n";
+					    	  	break;
+					    	  case NO_IGUAL:
+					    	  	regResult.valorBool = !(r1.valorCadena).equals(r2.valorCadena);
+					    	  	codigoExpresion += "	NEQ\n";
+					    	  	break;
+					    	  default:
+					    	  	minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+					    	  									SimpleCharStream.getBeginColumn(),
+			    				 								"La operación "+op+" no esta soportada para el tipo CADENA");
+			    				regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+					    	  	break;
+					    	}
+					    	break;
+					    	
+					    case BOOLEANO:
+					    	switch(op) {
+					    	  /*case MAYOR:
+					    	  	regResult.valorBool = r1.valorBool > r2.valorBool;
+					    	  	break;
+					    	  case MENOR:
+					    	  	regResult.valorBool = r1.valorBool < r2.valorBool;
+					    	  	break;
+					    	  case MAYOR_IG:
+					    	  	regResult.valorBool = r1.valorBool >= r2.valorBool;
+					    	  	break;
+					    	  case MENOR_IG:
+					    	  	regResult.valorBool = r1.valorBool <= r2.valorBool;
+					    	  	break;*/
+					    	  case IGUAL:
+					    	  	regResult.valorBool = r1.valorBool == r2.valorBool;
+					    	  	codigoExpresion += "	EQ\n";
+					    	  	break;
+					    	  case NO_IGUAL:
+					    	  	regResult.valorBool = r1.valorBool != r2.valorBool;
+					    	  	codigoExpresion += "	NEQ\n";
+					    	  	break;
+					    	  default:
+					    	  	minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+					    	  									SimpleCharStream.getBeginColumn(),
+			    				 								"La operación "+op+" no esta soportada para el tipo BOOLEANO");
+			    				regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+					    	  	break;
+					    	}
+					    	break;
+					    	
+					    case CHAR:
+					    	switch(op) {
+					    	  case MAYOR:
+					    	  	regResult.valorBool = r1.valorChar > r2.valorChar;
+					    	  	codigoExpresion += "	GT\n";
+					    	  	break;
+					    	  case MENOR:
+					    	  	regResult.valorBool = r1.valorChar < r2.valorChar;
+					    	  	codigoExpresion += "	LT\n";
+					    	  	break;
+					    	  case MAYOR_IG:
+					    	  	regResult.valorBool = r1.valorChar >= r2.valorChar;
+					    	  	codigoExpresion += "	GTE\n";
+					    	  	break;
+					    	  case MENOR_IG:
+					    	  	regResult.valorBool = r1.valorChar <= r2.valorChar;
+					    	  	codigoExpresion += "	LTE\n";
+					    	  	break;
+					    	  case IGUAL:
+					    	  	regResult.valorBool = r1.valorChar == r2.valorChar;
+					    	  	codigoExpresion += "	EQ\n";
+					    	  	break;
+					    	  case NO_IGUAL:
+					    	  	regResult.valorBool = r1.valorChar != r2.valorChar;
+					    	  	codigoExpresion += "	NEQ\n";
+					    	  	break;
+					    	  default:
+					    	  	break;
+					    	}
+					    	break;
+					    	
+					    default:
+					    	break;
+					  }
+			      }
+			      else {
+			        regResult.tipoVariable = tipo_variable.BOOLEANO;
+		    	  	regResult.tipoSimbolo = tipo_simbolo.EXPRESION;
+		    	  	switch(op) {
+			    	  case MAYOR:
+			    	  	codigoExpresion += "	GT\n";
+			    	  	break;
+			    	  case MENOR:
+			    	  	codigoExpresion += "	LT\n";
+			    	  	break;
+			    	  case MAYOR_IG:
+			    	  	codigoExpresion += "	GTE\n";
+			    	  	break;
+			    	  case MENOR_IG:
+			    	  	codigoExpresion += "	LTE\n";
+			    	  	break;
+			    	  case IGUAL:
+			    	  	codigoExpresion += "	EQ\n";
+			    	  	break;
+			    	  case NO_IGUAL:
+			    	  	codigoExpresion += "	NEQ\n";
+			    	  	break;
+			    	  default:
+			    	  	break;
+			    	}
+			      }  
+			    }
+			    r1 = regResult;
+		  	}
+		  }
+		)*
+
+		{
+	      if(r2 == null) {
+	        return r1;
+	      }
+	      else {
+	        return regResult;
+	      }
+	    }
+	} catch(ParseException e) {
+	  	String msgError="Expresión relacional no válida";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+		return null;
+	}
+}
+
+// operador_relacional ::= <tIGUAL> | <tMAYOR> | <tMENOR> | <tMAI> | <tMEI> | <tNI>
+TipoOperador operador_relacional() :
+{}
+{
+ 	try {
+		<tIGUAL>	{return TipoOperador.IGUAL; }
+		| <tMAYOR>	{return TipoOperador.MAYOR; }
+		| <tMENOR>	{return TipoOperador.MENOR; }
+		| <tMAI>	{return TipoOperador.MAYOR_IG; }
+		| <tMEI>	{return TipoOperador.MENOR_IG; }
+		| <tNI>		{return TipoOperador.NO_IGUAL; }
+	} catch(ParseException e) {
+	  	String msgError="Operador relacional no válido. Se espera \"=\", \">\", \"<\", \">=\", \"<=\" o \"<>\"";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+		return TipoOperador.NULL_OP;
+	}
+}
+
+// expresion_simple ::= termino ( operador_aditivo termino )*
+RegistroExpr expresion_simple(Simbolo sRef, boolean esInvocacion) :
+{
+	RegistroExpr r1 = null, r2 = null, regResult = null;
+	TipoOperador op;
+	Boolean ok;
+}
+{
+ 	try {
+		r1 = termino(sRef, esInvocacion)
+		(
+		  op = operador_aditivo()
+		  r2 = termino(null, false)
+		  {
+		    if(r1!=null && r2!=null) { 
+			    regResult = new RegistroExpr();
+			    ok = true;
+	
+				//caso OR
+				if(op == TipoOperador.OR) {
+				  if ((r1.tipoVariable != tipo_variable.DESCONOCIDO) && (r1.tipoVariable != tipo_variable.BOOLEANO)) {
+	    		    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+		    				   "El operador 1 debe ser booleano");
+		    	    ok = false;
+	    		  }
+	    		
+	    		  if ((r2.tipoVariable != tipo_variable.DESCONOCIDO) && (r2.tipoVariable != tipo_variable.BOOLEANO)) {
+	    		    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+		    		  		   "El operador 2 debe ser booleano");
+		    	    ok = false;
+	    		  }
+	
+				  if (ok) {
+	    		    if ((r1.tipoVariable != tipo_variable.DESCONOCIDO) && (r2.tipoVariable != tipo_variable.DESCONOCIDO)
+	    		    	 && (r1.tipoSimbolo==tipo_simbolo.CONSTANTE) && (r2.tipoSimbolo==tipo_simbolo.CONSTANTE)) {
+		    	      regResult.tipoVariable = tipo_variable.BOOLEANO;
+		    	      regResult.tipoSimbolo = tipo_simbolo.CONSTANTE;
+		    	      regResult.valorBool = r1.valorBool || r2.valorBool;
+		    	      codigoExpresion += "	OR\n";
+		    	    }
+		    	    else {
+		    	      if((r1.tipoVariable != tipo_variable.DESCONOCIDO) && (r2.tipoVariable != tipo_variable.DESCONOCIDO)) {
+			    	    regResult.tipoVariable = tipo_variable.BOOLEANO;
+			    	  }
+			    	  else {
+			    	    regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+			    	  }
+		    	      regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+		    	      regResult.tipoSimbolo = tipo_simbolo.EXPRESION;
+		    	      codigoExpresion += "	OR\n";
+		    	    }
+	    		  }
+	    		  else {
+	    		    regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+	    		    regResult.tipoSimbolo = tipo_simbolo.EXPRESION;
+	    		  }
+				}
+				else { //caso SUMA, RESTA
+				  if ((r1.tipoVariable != tipo_variable.DESCONOCIDO) && (r1.tipoVariable != tipo_variable.ENTERO)) {
+	    		    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+		    				   "El operador 1 debe ser entero");
+		    	    ok = false;
+	    		  }
+	    		
+	    		  if ((r2.tipoVariable != tipo_variable.DESCONOCIDO) && (r2.tipoVariable != tipo_variable.ENTERO)) {
+	    		    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+		    				   "El operador 2 debe ser entero");
+		    	    ok = false;
+	    		  }
+	
+				  if (ok) {
+	    		    if ((r1.tipoVariable != tipo_variable.DESCONOCIDO) && (r2.tipoVariable != tipo_variable.DESCONOCIDO)
+	    		    	&& (r1.tipoSimbolo==tipo_simbolo.CONSTANTE) && (r2.tipoSimbolo==tipo_simbolo.CONSTANTE)) {
+		    	      regResult.tipoVariable = tipo_variable.ENTERO;
+		    	      regResult.tipoSimbolo = tipo_simbolo.CONSTANTE;
+	
+					  switch(op) {
+			    	      case SUMA:
+			    	      	regResult.valorEnt = r1.valorEnt + r2.valorEnt;
+			    	      	codigoExpresion += "	PLUS\n";
+			    	      	break;
+			    	      	
+			    	      case RESTA:
+			    	      	regResult.valorEnt = r1.valorEnt - r2.valorEnt;
+			    	      	codigoExpresion += "	SBT\n";
+			    	      	break;
+			    	      	
+			    	      default:
+			    	      	break;
+			    	  }
+		    	    }
+		    	    else {
+		    	      if((r1.tipoVariable != tipo_variable.DESCONOCIDO) && (r2.tipoVariable != tipo_variable.DESCONOCIDO)) {
+		    	        regResult.tipoVariable = tipo_variable.ENTERO;
+		    	      }
+		    	      else {
+		    	        regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+		    	      }
+		    	      regResult.tipoSimbolo = tipo_simbolo.EXPRESION;
+		    	      switch(op) {
+			    	      case SUMA:
+			    	      	codigoExpresion += "	PLUS\n";
+			    	      	break;
+			    	      	
+			    	      case RESTA:
+			    	      	codigoExpresion += "	SBT\n";
+			    	      	break;
+			    	      	
+			    	      default:
+			    	      	break;
+			    	  }
+		    	    }
+	    		  }
+	    		  else {
+	    		    regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+	    		    regResult.tipoSimbolo = tipo_simbolo.EXPRESION;
+	    		  }
+				}
+				r1 = regResult;
+			}
+		  }
+		  )*
+		  
+		  {
+		    if(r2 == null) {
+		      return r1;
+		    }
+		    else {
+		      return regResult;
+		    }
+		  }
+		  
+	} catch(ParseException e) {
+	  	String msgError="Expresión aditiva no válida";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+		return null;
+	}
+}
+
+// operador_aditivo ::= <tMAS> | <tMENOS> | <tOR>
+TipoOperador operador_aditivo() :
+{}
+{
+ 	try {
+		<tMAS> 		{return TipoOperador.SUMA; }
+		| <tMENOS>	{return TipoOperador.RESTA; }
+		| <tOR>		{return TipoOperador.OR; }
+	} catch(ParseException e) {
+	  	String msgError="Operador aditivo no válido. Se esperaba \"+\", \"-\" o \"or\"";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+		return  TipoOperador.NULL_OP;
+	}
+}
+
+// termino ::= factor ( operador_multiplicativo factor )*
+RegistroExpr termino(Simbolo sRef, boolean esInvocacion) :
+{
+  	RegistroExpr r1 = null, r2 = null, regResult = null;
+	TipoOperador op;
+	Boolean ok;
+}
+{
+ 	try {
+		r1 = factor(sRef, esInvocacion)
+		(
+		  op = operador_multiplicativo()
+		  r2 = factor(null, false)
+		  {
+		    if(r1!=null && r2!=null) { 
+			    regResult = new RegistroExpr();
+			    ok = true;
+	
+			    //caso AND
+			    if(op == TipoOperador.AND) {
+			      	if ((r1.tipoVariable != tipo_variable.DESCONOCIDO) && (r1.tipoVariable != tipo_variable.BOOLEANO)) {
+		    		  minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+			    				 "El operador 1 debe ser booleano");
+			    	  ok = false;
+		    		}
+		    		
+		    		if ((r2.tipoVariable != tipo_variable.DESCONOCIDO) && (r2.tipoVariable != tipo_variable.BOOLEANO)) {
+		    		  minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+			    				 "El operador 2 debe ser booleano");
+			    	  ok = false;
+		    		}
+		
+					if (ok) {
+		    		  if ((r1.tipoVariable != tipo_variable.DESCONOCIDO) && (r2.tipoVariable != tipo_variable.DESCONOCIDO)
+		    		  		&& (r1.tipoSimbolo==tipo_simbolo.CONSTANTE) && (r2.tipoSimbolo==tipo_simbolo.CONSTANTE)) {
+			    	    regResult.tipoVariable = tipo_variable.BOOLEANO;
+			    	    regResult.tipoSimbolo = tipo_simbolo.CONSTANTE;
+			    	    regResult.valorBool = r1.valorBool && r2.valorBool;
+			    	    codigoExpresion += "	AND\n";
+			    	  }
+			    	  else {
+			    	    if((r1.tipoVariable != tipo_variable.DESCONOCIDO) && (r2.tipoVariable != tipo_variable.DESCONOCIDO)) {
+			    	      regResult.tipoVariable = tipo_variable.BOOLEANO;
+			    	    }
+			    	    else {
+			    	      regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+			    	    }
+			    	    regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+			    	    regResult.tipoSimbolo = tipo_simbolo.EXPRESION;
+			    	    codigoExpresion += "	AND\n";
+			    	  }
+		    		}
+		    		else {
+		    		  regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+		    		  regResult.tipoSimbolo = tipo_simbolo.EXPRESION;
+		    		}
+			    }
+			    else { //caso MUL, DIV, MOD
+			    	if ((r1.tipoVariable != tipo_variable.DESCONOCIDO) && (r1.tipoVariable != tipo_variable.ENTERO)) {
+		    		  minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+			    				 "El operador 1 debe ser entero");
+			    	  ok = false;
+		    		}
+		    		
+		    		if ((r2.tipoVariable != tipo_variable.DESCONOCIDO) && (r2.tipoVariable != tipo_variable.ENTERO)) {
+		    		  minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+			    				 "El operador 2 debe ser entero");
+			    	  ok = false;
+		    		}
+		
+					if (ok) {
+		    		  if ((r1.tipoVariable != tipo_variable.DESCONOCIDO) && (r2.tipoVariable != tipo_variable.DESCONOCIDO)
+		    		  		&& (r1.tipoSimbolo==tipo_simbolo.CONSTANTE) && (r2.tipoSimbolo==tipo_simbolo.CONSTANTE)) {
+		    		  		  
+			    	    regResult.tipoVariable = tipo_variable.ENTERO;
+			    	    regResult.tipoSimbolo = tipo_simbolo.CONSTANTE;
+			    	    switch(op) {
+			    	      case MUL:
+			    	      	regResult.valorEnt = r1.valorEnt * r2.valorEnt;
+			    	      	codigoExpresion += "	TMS\n";
+			    	      	break;
+			    	      	
+			    	      case DIV:
+			    	      	if(r2.valorEnt == 0) {
+			    	      	  minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+			    	      	  								  SimpleCharStream.getBeginColumn(),
+			    	      	  								  "División por 0");
+			    	      	  regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+			    	      	}
+			    	      	else {
+			    	      	  regResult.valorEnt = r1.valorEnt / r2.valorEnt;
+			    	      	  codigoExpresion += "	DIV\n";
+			    	      	}
+			    	      	break;
+			    	      	
+			    	      case MOD:
+			    	      	if(r2.valorEnt == 0) {
+			    	      	  minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+			    	      	  								  SimpleCharStream.getBeginColumn(),
+			    	      	  								  "Operación módulo por 0");
+			    	      	  regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+			    	      	}
+			    	      	else {
+			    	      	  regResult.valorEnt = r1.valorEnt % r2.valorEnt;
+			    	      	  codigoExpresion += "	MOD\n";
+			    	      	}
+			    	      	break;
+			    	      	
+			    	      default:
+			    	      	break;
+			    	    }
+			    	  }
+			    	  else if(r2.tipoSimbolo == tipo_simbolo.CONSTANTE && r2.valorEnt == 0 && op == TipoOperador.DIV) {
+			    	    	minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+			    	      	  								  SimpleCharStream.getBeginColumn(),
+			    	      	  								  "División por 0");
+			    	      	regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+			    	  }
+			    	  else if(r2.tipoSimbolo == tipo_simbolo.CONSTANTE && r2.valorEnt == 0 && op == TipoOperador.MOD) {
+			    	    	minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+			    	      	  								  SimpleCharStream.getBeginColumn(),
+			    	      	  								  "Operación módulo por 0");
+			    	      	regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+			    	  }
+			    	  else {
+			    	    if((r1.tipoVariable != tipo_variable.DESCONOCIDO) && (r2.tipoVariable != tipo_variable.DESCONOCIDO)) {
+			    	      regResult.tipoVariable = tipo_variable.ENTERO;
+			    	    }
+			    	    else {
+			    	      regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+			    	    }
+			    	    regResult.tipoSimbolo = tipo_simbolo.EXPRESION;
+			    	    switch(op) {
+			    	      case MUL:
+			    	      	codigoExpresion += "	TMS\n";
+			    	      	break;
+			    	      	
+			    	      case DIV:
+			    	      	codigoExpresion += "	DIV\n";
+			    	      	break;
+			    	      	
+			    	      case MOD:
+			    	      	codigoExpresion += "	MOD\n";
+			    	      	break;
+			    	      	
+			    	      default:
+			    	      	break;
+			    	    }
+			    	  }
+		    		}
+		    		else {
+		    		  regResult.tipoVariable = tipo_variable.DESCONOCIDO;
+		    		  regResult.tipoSimbolo = tipo_simbolo.EXPRESION;
+		    		}
+			    }
+			    r1 = regResult;
+		  	}
+		  }
+		 )*
+		{
+		  if(r2 == null) {
+	      	return r1;
+	      }
+	      else {
+	        return regResult;
+	      }
+		}
+	} catch(ParseException e) {
+	  	String msgError="Expresión multiplicativa no válida";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+		return null;
+	}
+}
+
+// operador_multiplicativo ::= <tPOR> | <tDIV> | <tDIV2> | <tMOD> | <tAND>
+TipoOperador operador_multiplicativo() :
+{}
+{
+ 	try {
+		<tPOR>		{return TipoOperador.MUL; }
+		| <tDIV>	{return TipoOperador.DIV; }
+		| <tDIV2>	{return TipoOperador.DIV; }
+		| <tMOD>	{return TipoOperador.MOD; }
+		| <tAND>	{return TipoOperador.AND; }
+	} catch(ParseException e) {
+	  	String msgError="Operador multiplicativo no válido. Se esperaba \"*\", \"div\", \"/\", \"div\" o \"and\"";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+		return TipoOperador.NULL_OP;
+	}
+}
+
+// factor ::= "-" factor | <tNOT> factor | "(" expresion ")" | <tENTACAR> "(" expresion ")"
+// | <tCARAENT> "(" expresion ")" | <tIDENTIFICADOR> | <tCONSTENTERA> | <tCONSTCHAR> | <tCONSTCAD>
+// | <tTRUE>
+// | <tFALSE>
+RegistroExpr factor(Simbolo sRef, boolean esInvocacion) :
+{
+  	RegistroExpr result = null, r1 = null;
+	tipo_variable tpID = tipo_variable.NULL_V;
+	tipo_simbolo tpSID = tipo_simbolo.NULL_S;
+	clase_parametro tpPID = clase_parametro.NULL_P;
+	String nombre = "";
+	int nivelVar = 0;
+	int dirVar = 0;
+	Token t1 = null;
+	Simbolo s = null;
+}
+{
+ 	try {
+			<tMENOS> r1 = factor(null, false)
+			{
+			  if(r1!=null) {
+			      result = new RegistroExpr();
+			  
+				  if((r1.tipoVariable != tipo_variable.ENTERO) && (r1.tipoVariable != tipo_variable.DESCONOCIDO)) {
+				    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+				    				 "Tipo incompatible. Se esperaba entero");
+				    result.tipoVariable = tipo_variable.DESCONOCIDO;
+				  }
+				  else {
+				    result.tipoVariable = tipo_variable.ENTERO;
+				    result.tipoSimbolo = r1.tipoSimbolo;
+				    result.tipoParam = r1.tipoParam;
+				    result.valorEnt = -r1.valorEnt;
+				  }
+	
+				  codigoExpresion += "	NGI\n";
+			  }
+			  
+			  return result;
+			}
+			
+		| 	<tNOT> r1 = factor(null, false)
+			{
+			  if(r1!=null) {
+			      result = new RegistroExpr();
+			  
+				  if((r1.tipoVariable != tipo_variable.BOOLEANO) && (r1.tipoVariable != tipo_variable.DESCONOCIDO)) {
+				    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+				    				 "Tipo incompatible. Se esperaba booleano");
+				    result.tipoVariable = tipo_variable.DESCONOCIDO;
+				  }
+				  else {
+				    result.tipoVariable = tipo_variable.BOOLEANO;
+				    result.tipoSimbolo = r1.tipoSimbolo;
+				    result.tipoParam = r1.tipoParam;
+				    result.valorBool = r1.valorBool;
+				  }
+	
+				  codigoExpresion += "	NGB\n";
+				  }
+			  
+			  return result;
+			}
+			
+		| 	<tPARAB> result = expresion(sRef, esInvocacion) <tPARCE>
+			{
+			  //codigoConstanteOExpresion(result, false);
+			  
+			  return result;
+			}
+			
+		| 	<tENTACAR> <tPARAB> r1 = expresion(null, false) <tPARCE>
+			{
+			  //codigoConstanteOExpresion(r1,false);
+
+			  if(r1!=null) {
+				  result = new RegistroExpr();
+	
+				  if((r1.tipoVariable != tipo_variable.ENTERO) && (r1.tipoVariable != tipo_variable.DESCONOCIDO)) {
+				    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+				    				 "La expresión no se puede convertir en un carácter válido. Se debe recibir entero");
+				    result.tipoVariable = tipo_variable.DESCONOCIDO;
+				  }
+				  else if(r1.tipoVariable == tipo_variable.ENTERO && ((r1.valorEnt<0) || (r1.valorEnt >256))) {
+				    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+				    				 "ENTACAR debe recibir un valor de tipo entero comprendido entre 0 y 256");
+				    result.tipoVariable = tipo_variable.DESCONOCIDO;
+				  }
+				  else {
+				    result.tipoVariable = tipo_variable.CHAR;
+				    result.tipoSimbolo = r1.tipoSimbolo;
+					result.tipoParam = r1.tipoParam;
+				    result.valorChar = (char)r1.valorEnt;
+				  }
+				}
+
+			  return result;
+			}
+			
+		| 	<tCARAENT> <tPARAB> r1 = expresion(null, false) <tPARCE>
+			{
+			  //codigoConstanteOExpresion(r1, false);
+			  
+			  if(r1!=null) {
+			  	result = new RegistroExpr();
+
+			  
+			    if((r1.tipoVariable != tipo_variable.CHAR) && (r1.tipoVariable != tipo_variable.DESCONOCIDO)) {
+				    minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(),
+				    				 "La expresión no se puede convertir en un entero válido. Se espera CARACTER");
+				    result.tipoVariable = tipo_variable.DESCONOCIDO;
+				}
+				else {
+				    result.tipoVariable = tipo_variable.ENTERO;
+				    result.tipoSimbolo = r1.tipoSimbolo;
+					result.tipoParam = r1.tipoParam;
+				    result.valorEnt = r1.valorChar;
+				}
+			  }
+
+			  return result;
+			}
+			
+		| 	t1 = <tIDENTIFICADOR>
+			{
+			  result = new RegistroExpr();
+			  try {
+			    s = tablaSimbolos.buscar_simbolo(t1.toString(), nivel);
+			    tpID = s.getVariable();
+			    tpSID = s.getTipo();
+			    if(tpSID == tipo_simbolo.PARAMETRO) {
+			      tpPID = s.getParametro();
+			    }
+			    nombre = s.getNombre();
+			    nivelVar = s.getNivel();
+			    dirVar = s.getDir();
+			  }
+			  catch (SimboloNoEncontradoException e){
+			    errSem++;
+			    System.out.println(e.getMessage());
+			    //introducir como desconocido
+			    introducirSimboloVariable(t1, tipo_variable.DESCONOCIDO);
+			    tpID = tipo_variable.DESCONOCIDO;
+			  }
+
+			  result.tipoVariable = tpID;
+			  result.tipoSimbolo = tpSID;
+			  result.tipoParam = tpPID;
+			  result.nombre = nombre;
+
+			  if(sRef!=null && esInvocacion && sRef.es_referencia()) {
+			    codigoExpresion += "; Dirección de la variable "+nombre+".\n";
+				int f = nivel - nivelVar;
+				int o = dirVar;
+				codigoExpresion += "	SRF   "+f+"  "+o+"\n";
+				if(s!=null && s.es_referencia()) {
+				  codigoExpresion += "	DRF\n";
+				}
+			  }
+			  else {
+			    codigoExpresion += "; Acceso a la variable "+nombre.toUpperCase()+".\n";
+				int f = nivel - nivelVar;
+				int o = dirVar;
+				codigoExpresion += "	SRF   "+f+"  "+o+"\n";
+				codigoExpresion += "	DRF\n";
+				if(s!=null && s.es_referencia()) {
+				  codigoExpresion += "	DRF\n";
+				}
+			  }
+				
+			  return result;
+			}
+			
+		| 	t1 = <tCONSTENTERO>
+			{
+			  result = new RegistroExpr();
+
+			  result.valorEnt = Integer.parseInt(t1.toString());
+
+			  if(result.valorEnt > 32000) {
+			    	minilengcompiler.errorSemantico(SimpleCharStream.getBeginLine(),
+			  	   								   SimpleCharStream.getBeginColumn(),
+		    				 					   "Valor entero fuera de rango");
+			  }
+			  
+			  result.tipoVariable = tipo_variable.ENTERO;
+			  result.tipoSimbolo = tipo_simbolo.CONSTANTE;
+
+			  codigoExpresion += "	STC   "+ result.valorEnt+"\n";
+
+			  return result;
+			}
+		
+		| 	t1 = <tCONSTCHAR>
+			{
+			  result = new RegistroExpr();
+			  
+			  result.valorChar = (t1.toString()).charAt(1); //porque la constante va así "J"
+			  result.tipoVariable = tipo_variable.CHAR;
+			  result.tipoSimbolo = tipo_simbolo.CONSTANTE;
+
+			  codigoExpresion += "	STC   "+ (int)(t1.image).charAt(1)+"\n";
+
+			  return result;
+			}
+		
+		| 	t1 = <tCONSTCAD>
+			{
+			  result = new RegistroExpr();
+			  
+			  result.valorCadena = t1.toString();
+			  result.tipoVariable = tipo_variable.CADENA;
+			  result.tipoSimbolo = tipo_simbolo.CONSTANTE;
+
+			  return result;
+			}
+		
+		| 	<tTRUE>
+			{
+			  result = new RegistroExpr();
+			  
+			  result.valorBool = true;
+			  result.tipoVariable = tipo_variable.BOOLEANO;
+			  result.tipoSimbolo = tipo_simbolo.CONSTANTE;
+
+			  codigoExpresion += "	STC   1\n";
+
+			  return result;
+			}
+			
+		| 	<tFALSE>
+			{
+			  result = new RegistroExpr();
+			  
+			  result.valorBool = false;
+			  result.tipoVariable = tipo_variable.BOOLEANO;
+			  result.tipoSimbolo = tipo_simbolo.CONSTANTE;
+
+			  codigoExpresion += "	STC   0\n";
+
+			  return result;
+			}
+		
+	} catch(ParseException e) {
+	  	String msgError="Constante o identificador no válidos, paréntesis no cerrado, o expresión no válida";
+		minilengcompiler.errorSintactico(SimpleCharStream.getBeginLine(), SimpleCharStream.getBeginColumn(), msgError);
+		return null;
+	}
+}
