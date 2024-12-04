@@ -1,4 +1,4 @@
 # ProcesadoresDeLenguajes-Compilador
-Compilador para un pequeño lenguaje llamado MiniLeng. Implementación completa de la parte léxica, sintáctica y semántica. Proyecto para la asignatura Procesadores de Lenguajes, Universidad de Zaragoza.
+Compiler for a small language called MiniLeng. Complete implementation of the lexical, syntactic, and semantic parts. Project for the course Language Processors, Universidad de Zaragoza.
 
-Tanto en pruebaLexico, pruebaSintactico, pruebaSemantico hay pequeños ejemplos de cómo es el lenguaje.
+Both in pruebaLexico, pruebaSintactico, and pruebaSemantico, there are small examples of how the language works.
